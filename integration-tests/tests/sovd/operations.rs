@@ -379,11 +379,11 @@ async fn test_async_operation_in_flight_conflict() {
     let post_body: AsyncPostBody = response_to_t(&post_response).unwrap();
     let execution_id = post_body.id.clone();
 
-    // Second POST while first is still tracked — also succeeds with 202 (no conflict on Start)
-    let post_response2 = send_cda_request(
+    // Second POST while first is still running — rejected with 409 Conflict
+    send_cda_request(
         &runtime.config,
         &format!("{ecu_endpoint}/operations/calibratesensors/executions"),
-        StatusCode::ACCEPTED,
+        StatusCode::CONFLICT,
         Method::POST,
         Some("{}"),
         Some(&auth),
@@ -391,30 +391,16 @@ async fn test_async_operation_in_flight_conflict() {
     )
     .await
     .unwrap();
-    let post_body2: AsyncPostBody = response_to_t(&post_response2).unwrap();
-    let execution_id2 = post_body2.id.clone();
 
     let query_params = QueryParams(HashMap::from_iter([(
         "x-sovd2uds-force".to_string(),
         "true".to_string(),
     )]));
 
-    // Clean up both executions using force=true
+    // Clean up the first execution using force=true
     send_cda_request(
         &runtime.config,
         &format!("{ecu_endpoint}/operations/calibratesensors/executions/{execution_id}"),
-        StatusCode::OK,
-        Method::DELETE,
-        None,
-        Some(&auth),
-        Some(&query_params),
-    )
-    .await
-    .unwrap();
-
-    send_cda_request(
-        &runtime.config,
-        &format!("{ecu_endpoint}/operations/calibratesensors/executions/{execution_id2}"),
         StatusCode::OK,
         Method::DELETE,
         None,

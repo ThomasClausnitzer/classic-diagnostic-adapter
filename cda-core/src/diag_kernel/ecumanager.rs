@@ -646,8 +646,11 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
                 diag_service.name
             )))?;
 
-        self.check_service_access(security_plugin, &mapped_service)
-            .await?;
+        // Skip the service access check for functional calls
+        if functional_group_name.is_none() {
+            self.check_service_access(security_plugin, &mapped_service)
+                .await?;
+        }
 
         let mut mapped_params = request
             .params()
@@ -6727,6 +6730,131 @@ mod tests {
         (new_ecu_manager(db), dc)
     }
 
+    /// Helper that builds an ECU manager whose variant has a service with a
+    /// `ProgrammingSecurity` precondition **and** a functional group containing
+    /// the same service. Returns `(ecu_manager, diag_comm, sid)`.
+    fn create_ecu_manager_with_preconditions_and_functional_group() -> (
+        super::EcuManager<DefaultSecurityPluginData>,
+        cda_interfaces::DiagComm,
+        u8,
+    ) {
+        let mut db_builder = EcuDataBuilder::new();
+        let protocol = db_builder.create_protocol(Protocol::DoIp.value(), None, None, None);
+        let cp_ref = db_builder.create_com_param_ref(None, None, None, Some(protocol), None);
+
+        let locked_state = db_builder.create_state("LockedSecurity", None);
+        let extended_state = db_builder.create_state("ExtendedSecurity", None);
+        let programming_state = db_builder.create_state("ProgrammingSecurity", None);
+
+        let default_session_state = db_builder.create_state("DefaultSession", None);
+        let extended_session_state = db_builder.create_state("ExtendedSession", None);
+        let programming_session_state = db_builder.create_state("ProgrammingSession", None);
+
+        let locked_to_extended = db_builder.create_state_transition(
+            "LockedToExtended",
+            Some("LockedSecurity"),
+            Some("ExtendedSecurity"),
+        );
+        let extended_to_programming = db_builder.create_state_transition(
+            "ExtendedToProgramming",
+            Some("ExtendedSecurity"),
+            Some("ProgrammingSecurity"),
+        );
+        let default_to_extended_session = db_builder.create_state_transition(
+            "DefaultToExtended",
+            Some("DefaultSession"),
+            Some("ExtendedSession"),
+        );
+        let extended_to_programming_session = db_builder.create_state_transition(
+            "ExtendedToProgramming",
+            Some("ExtendedSession"),
+            Some("ProgrammingSession"),
+        );
+
+        let security_state_chart = db_builder.create_state_chart(
+            "SecurityAccess",
+            Some(semantics::SECURITY),
+            Some(vec![locked_to_extended, extended_to_programming]),
+            Some("LockedSecurity"),
+            Some(vec![locked_state, extended_state, programming_state]),
+        );
+        let session_state_chart = db_builder.create_state_chart(
+            "Session",
+            Some(semantics::SESSION),
+            Some(vec![
+                default_to_extended_session,
+                extended_to_programming_session,
+            ]),
+            Some("DefaultSession"),
+            Some(vec![
+                default_session_state,
+                extended_session_state,
+                programming_session_state,
+            ]),
+        );
+
+        let precondition_ref = db_builder.create_pre_condition_state_ref(programming_state);
+        let sid = service_ids::WRITE_DATA_BY_IDENTIFIER;
+        let dc_name = "TestFGService";
+
+        // Service for the functional group diag layer
+        let fg_diag_comm = db_builder.create_diag_comm(DiagCommParams {
+            short_name: dc_name,
+            pre_condition_state_refs: Some(vec![precondition_ref]),
+            protocols: Some(vec![protocol]),
+            ..Default::default()
+        });
+        let fg_request = create_sid_only_request!(db_builder, sid);
+        let fg_service = new_diag_service!(db_builder, fg_diag_comm, fg_request, vec![], vec![]);
+        let fg_layer = db_builder.create_diag_layer(DiagLayerParams {
+            short_name: "TestFunctionalGroup",
+            diag_services: Some(vec![fg_service]),
+            ..Default::default()
+        });
+        let functional_group = db_builder.create_functional_group(fg_layer, None);
+
+        // Same service for the variant diag layer
+        let variant_diag_comm = db_builder.create_diag_comm(DiagCommParams {
+            short_name: dc_name,
+            pre_condition_state_refs: Some(vec![precondition_ref]),
+            protocols: Some(vec![protocol]),
+            ..Default::default()
+        });
+        let variant_request = create_sid_only_request!(db_builder, sid);
+        let variant_service = new_diag_service!(
+            db_builder,
+            variant_diag_comm,
+            variant_request,
+            vec![],
+            vec![]
+        );
+        let variant_layer = db_builder.create_diag_layer(DiagLayerParams {
+            short_name: TEST_DIAG_LAYER,
+            com_param_refs: Some(vec![cp_ref]),
+            diag_services: Some(vec![variant_service]),
+            state_charts: Some(vec![session_state_chart, security_state_chart]),
+            ..Default::default()
+        });
+        let variant = db_builder.create_variant(variant_layer, true, None, None);
+
+        let db = db_builder.finish(EcuDataParams {
+            ecu_name: "TestEcu",
+            revision: "1",
+            version: "1.0.0",
+            variants: Some(vec![variant]),
+            functional_groups: Some(vec![functional_group]),
+            ..Default::default()
+        });
+
+        let dc = cda_interfaces::DiagComm {
+            name: dc_name.to_owned(),
+            type_: DiagCommType::Configurations,
+            lookup_name: Some(dc_name.to_owned()),
+            subfunction_id: None,
+        };
+        (new_ecu_manager(db), dc, sid)
+    }
+
     fn create_ecu_manager_with_length_key_request_service()
     -> (super::EcuManager<DefaultSecurityPluginData>, DiagComm, u8) {
         let mut db_builder = EcuDataBuilder::new();
@@ -8553,6 +8681,47 @@ mod tests {
             result.is_err(),
             "Service should NOT be allowed when neither current nor default security state is in \
              the allowed set"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_functional_group_service_skips_precondition_check() {
+        let (ecu_manager, dc, sid) = create_ecu_manager_with_preconditions_and_functional_group();
+
+        // Set ECU to LockedSecurity — does NOT satisfy the ProgrammingSecurity precondition.
+        {
+            let mut ecu_states = ecu_manager.ecu_service_states.write().await;
+            ecu_states.insert(service_ids::SESSION_CONTROL, "DefaultSession".to_string());
+            ecu_states.insert(service_ids::SECURITY_ACCESS, "LockedSecurity".to_string());
+        }
+
+        // Variant path (functional_group_name = None) must FAIL the precondition.
+        let variant_result = ecu_manager
+            .create_uds_payload(
+                &dc,
+                &skip_sec_plugin!(),
+                Some(UdsPayloadData::Raw(vec![sid])),
+                None,
+            )
+            .await;
+        assert!(
+            variant_result.is_err(),
+            "Variant service should be rejected when preconditions are not met"
+        );
+
+        // Functional group path must SUCCEED — preconditions are not checked.
+        let fg_result = ecu_manager
+            .create_uds_payload(
+                &dc,
+                &skip_sec_plugin!(),
+                Some(UdsPayloadData::Raw(vec![sid])),
+                Some("TestFunctionalGroup"),
+            )
+            .await;
+        assert!(
+            fg_result.is_ok(),
+            "Functional group service should skip precondition check. Error: {:?}",
+            fg_result.err()
         );
     }
 

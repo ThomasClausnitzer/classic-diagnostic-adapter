@@ -409,7 +409,19 @@ fn handle_ecu_response<R: DiagServiceResponse>(
                             error: nrc_to_api_error_response(nrc, false),
                         });
                     }
-                    Err(_) => todo!(),
+                    Err(_) => {
+                        errors.push(sovd_interfaces::error::DataError {
+                            path: format!("/{data_tag}/{ecu_name}"),
+                            error: sovd_interfaces::error::ApiErrorResponse {
+                                message: "Failed to interpret negative response".to_owned(),
+                                error_code: sovd_interfaces::error::ErrorCode::VendorSpecific,
+                                vendor_code: Some(VendorErrorCode::ErrorInterpretingMessage),
+                                parameters: None,
+                                error_source: Some("ecu".to_owned()),
+                                schema: None,
+                            },
+                        });
+                    }
                 }
             }
         }
